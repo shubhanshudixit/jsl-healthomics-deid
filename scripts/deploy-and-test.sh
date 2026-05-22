@@ -55,22 +55,43 @@ if ! echo "$CONTAINER_IMAGE" | grep -qE '^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaw
 fi
 ok "Container image: $CONTAINER_IMAGE"
 
-# ── prereq 3: JSL license ──────────────────────────────────────────────
-banner "Prereq 3/3 — JSL license"
-echo "  Your JSL license is a JSON document provided by John Snow Labs."
-echo "  It contains SPARK_NLP_LICENSE, SPARK_OCR_LICENSE, SECRET, and related fields."
-echo "  You will paste it into AWS Secrets Manager after the stack deploys."
+# ── prereq 3: JSL license secret ──────────────────────────────────────
+banner "Prereq 3/3 — JSL license secret in Secrets Manager"
+echo "  Your JSL license must already be stored in AWS Secrets Manager"
+echo "  before this script can proceed."
 echo ""
-echo "  Do you have your JSL license JSON from John Snow Labs?"
-read -p "  [y/N]: " -r HAS_LICENSE
-[[ "${HAS_LICENSE:-N}" =~ ^[Yy]$ ]] \
-  || err "You need a JSL license to use this product. Contact John Snow Labs to obtain one."
-ok "License confirmed — you will paste it into Secrets Manager after the stack deploys"
+echo "  If you haven't done this yet:"
+echo "    1. Open Secrets Manager in the AWS Console"
+echo "    2. Store a new secret → Other type of secret"
+echo "    3. Paste your JSL license JSON (provided by John Snow Labs)"
+echo "    4. Name it anything (e.g. jsl-dicom-deid-license)"
+echo "    5. Copy the full secret ARN from the secret's detail page"
+echo ""
+echo "  The secret ARN looks like:"
+echo "    arn:aws:secretsmanager:us-east-1:123456789012:secret:jsl-dicom-deid-license-AbCdEf"
+echo ""
+read -p "  Paste your secret ARN: " JSL_SECRET_ARN
+[[ -z "$JSL_SECRET_ARN" ]] && err "Secret ARN is required. Create the secret in Secrets Manager first."
 
-# ── secret name ───────────────────────────────────────────────────────
-echo ""
-read -p "  Name for the Secrets Manager secret [jsl-dicom-deid-license]: " SECRET_NAME
-SECRET_NAME="${SECRET_NAME:-jsl-dicom-deid-license}"
+# Validate the secret exists and is readable
+echo "  Validating secret..."
+SECRET_VALUE=$(aws secretsmanager get-secret-value \
+  --secret-id "$JSL_SECRET_ARN" --region "$REGION" \
+  --query SecretString --output text 2>/dev/null) \
+  || err "Could not read secret '$JSL_SECRET_ARN'. Check the ARN and that you have secretsmanager:GetSecretValue permission."
+
+# Check all required fields are present and non-empty
+MISSING_FIELDS=""
+for FIELD in SPARK_NLP_LICENSE SPARK_OCR_LICENSE SECRET SPARK_OCR_SECRET; do
+  if ! python3 -c "import sys,json; d=json.load(sys.stdin); assert '$FIELD' in d and len(d['$FIELD']) > 10" \
+       <<< "$SECRET_VALUE" 2>/dev/null; then
+    MISSING_FIELDS="$MISSING_FIELDS $FIELD"
+  fi
+done
+[[ -z "$MISSING_FIELDS" ]] \
+  || err "Secret is missing or has empty fields:$MISSING_FIELDS — update the secret and re-run."
+
+ok "Secret validated — all required license fields present"
 
 echo ""
 echo -e "${BOLD}  Summary of what will be deployed:${RESET}"
@@ -78,7 +99,7 @@ echo "  Account       : $ACCOUNT_ID"
 echo "  Region        : $REGION"
 echo "  Stack name    : $STACK_NAME"
 echo "  S3 bucket     : jsl-dicom-deid-${ACCOUNT_ID}-${REGION}  (created by stack)"
-echo "  Secret name   : $SECRET_NAME  (you will paste your license into it)"
+echo "  JSL secret    : $JSL_SECRET_ARN"
 echo "  Container     : $CONTAINER_IMAGE"
 echo "  Instance type : omics.m.xlarge (4 vCPU / 16 GB — cheapest for this workload)"
 echo ""
@@ -113,7 +134,7 @@ aws cloudformation deploy \
   --template-file "$WORK_DIR/infra/setup.yml" \
   --stack-name   "$STACK_NAME" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides JslSecretName="$SECRET_NAME" \
+  --parameter-overrides JslSecretArn="$JSL_SECRET_ARN" \
   --region "$REGION"
 ok "Stack deployed"
 
@@ -125,7 +146,7 @@ _out() {
     --output text
 }
 BUCKET=$(_out S3BucketName)
-SECRET_ARN=$(_out JslSecretArn)
+SECRET_ARN="$JSL_SECRET_ARN"          # supplied and validated during prereq check
 RUN_ROLE_ARN=$(_out OmicsRunRoleArn)
 VPC_CONFIG=$(_out OmicsVpcConfigName)
 
@@ -133,55 +154,6 @@ echo "  Bucket      : $BUCKET"
 echo "  Secret ARN  : $SECRET_ARN"
 echo "  Run Role    : $RUN_ROLE_ARN"
 echo "  VPC Config  : $VPC_CONFIG"
-
-# ── populate JSL license into Secrets Manager ──────────────────────────
-# The stack created a placeholder secret. The workflow will fail unless the
-# real license is in place before we start the run.
-banner "Action required — paste your JSL license into Secrets Manager"
-CONSOLE_URL="https://${REGION}.console.aws.amazon.com/secretsmanager/home?region=${REGION}#!/secret?name=${SECRET_NAME}"
-echo ""
-echo "  The stack created a Secrets Manager secret with placeholder values."
-echo "  You must replace them with your real JSL license JSON now."
-echo ""
-echo "  1. Open this URL in your browser (Ctrl+click or copy-paste):"
-echo -e "     ${BOLD}${CONSOLE_URL}${RESET}"
-echo ""
-echo "  2. Click 'Retrieve secret value'  →  'Edit'"
-echo ""
-echo "  3. Replace the entire JSON with your JSL license JSON:"
-echo '     {'
-echo '       "SPARK_NLP_LICENSE":  "eyJhbGci...  (your JWT)",  '
-echo '       "SPARK_OCR_LICENSE":  "eyJhbGci...  (your JWT)",'
-echo '       "SECRET":             "6.x.x-xxxxx",'
-echo '       "SPARK_OCR_SECRET":   "6.x.x-xxxxx",'
-echo '       "JSL_VERSION":        "6.4.0",'
-echo '       "OCR_VERSION":        "6.4.0",'
-echo '       "PUBLIC_VERSION":     "6.4.0"'
-echo '     }'
-echo ""
-echo "  4. Do NOT include AWS_ACCESS_KEY_ID / SECRET_ACCESS_KEY / SESSION_TOKEN."
-echo "     The container fetches fresh credentials automatically."
-echo ""
-read -p "  Press Enter once you have saved the license in Secrets Manager..."
-
-# Validate the secret is no longer a placeholder
-echo "  Validating secret..."
-SECRET_VALUE=$(aws secretsmanager get-secret-value \
-  --secret-id "$SECRET_ARN" --region "$REGION" \
-  --query SecretString --output text 2>/dev/null) \
-  || err "Could not read secret $SECRET_ARN — check IAM permissions."
-
-if echo "$SECRET_VALUE" | grep -q "PASTE_YOUR"; then
-  err "Secret still contains placeholder text. Please edit the secret in Secrets Manager and re-run this script."
-fi
-
-# Check required fields are present
-for FIELD in SPARK_NLP_LICENSE SPARK_OCR_LICENSE SECRET SPARK_OCR_SECRET; do
-  if ! echo "$SECRET_VALUE" | python3 -c "import sys,json; d=json.load(sys.stdin); assert '$FIELD' in d and d['$FIELD'] != ''" 2>/dev/null; then
-    err "Secret is missing or has empty field: $FIELD. Edit the secret and re-run."
-  fi
-done
-ok "License secret validated — all required fields present"
 
 # ── register HealthOmics workflows ─────────────────────────────────────
 banner "Registering HealthOmics workflows"

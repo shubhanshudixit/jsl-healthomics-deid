@@ -1,43 +1,42 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   JSL DICOM De-Identification — AWS HealthOmics Marketplace Setup.
-  Deploys everything a customer needs in one click:
-  VPC + NAT networking, IAM run role, Secrets Manager secret placeholder,
-  S3 bucket, and the HealthOmics VPC configuration.
+  Deploys VPC + NAT networking, IAM run role, S3 bucket, and the
+  HealthOmics VPC configuration. Your JSL license must already exist
+  in Secrets Manager before deploying this stack — pass its ARN as
+  the JslSecretArn parameter.
   Supported regions: us-east-1, us-west-2, eu-west-1, eu-west-2,
   eu-central-1, ap-southeast-1, ap-southeast-2.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Parameter grouping for the AWS Console wizard (non-technical users see
-# a clean form with labelled sections).
-# ─────────────────────────────────────────────────────────────────────────────
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: "1. JSL License"
+          default: "1. JSL License (prerequisite — create this secret before deploying)"
         Parameters:
-          - JslSecretName
+          - JslSecretArn
       - Label:
           default: "2. Networking"
         Parameters:
           - VpcCidr
           - OmicsVpcConfigName
     ParameterLabels:
-      JslSecretName:
-        default: "Secret name for your JSL license (you will paste the license JSON after deploy)"
+      JslSecretArn:
+        default: "ARN of your Secrets Manager secret containing the JSL license JSON"
       VpcCidr:
         default: "VPC CIDR block (leave default unless it conflicts with your existing VPCs)"
       OmicsVpcConfigName:
         default: "Name for the HealthOmics VPC configuration"
 
 Parameters:
-  JslSecretName:
+  JslSecretArn:
     Type: String
-    Default: jsl-dicom-deid-license
-    Description: Name for the Secrets Manager secret that will hold your JSL license JSON.
-    AllowedPattern: "^[a-zA-Z0-9/_+=.@-]+$"
-    ConstraintDescription: Must be a valid Secrets Manager secret name.
+    Description: >
+      ARN of the Secrets Manager secret containing your JSL license JSON.
+      Create this secret before deploying the stack — see the Customer Onboarding Guide.
+      Format: arn:aws:secretsmanager:REGION:ACCOUNT:secret:SECRET-NAME-XXXXXX
+    AllowedPattern: "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$"
+    ConstraintDescription: Must be a valid Secrets Manager secret ARN.
 
   VpcCidr:
     Type: String
@@ -288,7 +287,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref JslLicenseSecret
+                Resource: !Ref JslSecretArn   # customer's pre-existing secret
               - Sid: LogsAccess
                 Effect: Allow
                 Action:
@@ -296,31 +295,6 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/omics/*"
-
-  # ── Secrets Manager Secret ────────────────────────────────────────────────
-  # Placeholder — customer fills in their JSL license JSON after the stack deploys.
-
-  JslLicenseSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Ref JslSecretName
-      Description: >
-        JSL license JSON for DICOM de-identification.
-        After the stack deploys, edit this secret and paste your JSL license JSON.
-        See the Customer Onboarding Guide for the required JSON format.
-      SecretString: |
-        {
-          "SPARK_NLP_LICENSE":    "PASTE_YOUR_SPARK_NLP_LICENSE_JWT_HERE",
-          "SPARK_OCR_LICENSE":    "PASTE_YOUR_SPARK_OCR_LICENSE_JWT_HERE",
-          "SECRET":               "PASTE_YOUR_JSL_SECRET_HERE",
-          "SPARK_OCR_SECRET":     "PASTE_YOUR_SPARK_OCR_SECRET_HERE",
-          "JSL_VERSION":          "6.4.0",
-          "OCR_VERSION":          "6.4.0",
-          "PUBLIC_VERSION":       "6.4.0"
-        }
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-jsl-license"
 
   # ── HealthOmics VPC Configuration (Lambda-backed Custom Resource) ──────────
   # HealthOmics VPC configurations are not native CloudFormation resources, so
@@ -359,7 +333,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-omics-vpc-config"
-      Description: Custom resource handler — creates and deletes the HealthOmics VPC configuration.
+      Description: Custom resource handler - creates and deletes the HealthOmics VPC configuration.
       Runtime: python3.11
       Handler: index.handler
       Role: !GetAtt OmicsConfigLambdaRole.Arn
@@ -429,14 +403,14 @@ Resources:
 Outputs:
 
   S3BucketName:
-    Description: "S3 bucket for your DICOM input/output files. Upload your input DICOMs here."
+    Description: "S3 bucket for your DICOM input/output files."
     Value: !Ref JslDicomBucket
     Export:
       Name: !Sub "${AWS::StackName}-bucket"
 
   JslSecretArn:
-    Description: "ARN of the Secrets Manager secret — paste your JSL license JSON into this secret before running any workflow."
-    Value: !Ref JslLicenseSecret
+    Description: "ARN of the JSL license secret passed into this stack (echoed back for convenience)."
+    Value: !Ref JslSecretArn
     Export:
       Name: !Sub "${AWS::StackName}-secret-arn"
 
@@ -459,7 +433,3 @@ Outputs:
   PrivateSubnetId:
     Description: "Private subnet ID where HealthOmics ENIs are placed."
     Value: !Ref PrivateSubnet
-
-  NextStep:
-    Description: "ACTION REQUIRED — Open the Secrets Manager console, find the secret above, and paste your JSL license JSON."
-    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/secretsmanager/home?region=${AWS::Region}#!/secret?name=${JslSecretName}"
