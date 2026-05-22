@@ -10,135 +10,89 @@ STACK_NAME="jsl-dicom-deid"
 WORK_DIR="/tmp/jsl-deid-$$"
 STATE_FILE="$HOME/jsl-deploy-state.json"
 
-# ── colours ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; BOLD='\033[1m'; RESET='\033[0m'
 warn()  { echo -e "${YELLOW}⚠  $*${RESET}"; }
 ok()    { echo -e "${GREEN}✅ $*${RESET}"; }
 err()   { echo -e "${RED}❌ $*${RESET}"; exit 1; }
 banner(){ echo -e "\n${BOLD}── $* ──${RESET}"; }
 
-# ═══════════════════════════════════════════════════════════════════════
-# PREREQUISITES CHECK
-# Verify the user has everything they need before spending any time or
-# money deploying infrastructure.
-# ═══════════════════════════════════════════════════════════════════════
 echo -e "${BOLD}"
 echo "  ╔══════════════════════════════════════════════════════════════╗"
 echo "  ║     JSL DICOM De-Identification — AWS HealthOmics Setup     ║"
 echo "  ╚══════════════════════════════════════════════════════════════╝"
 echo -e "${RESET}"
-echo "  Before we begin, confirm you have the following ready."
-echo "  The script will stop immediately if anything is missing."
-echo ""
 
-# ── prereq 1: AWS CLI / credentials ────────────────────────────────────
-banner "Prereq 1/3 — AWS credentials"
+# ── prereq 1: AWS credentials (automatic) ─────────────────────────────
+banner "Step 1/5 — Checking AWS credentials"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
-  || err "No AWS credentials found. Open this from AWS CloudShell, or run 'aws configure' first."
+  || err "No AWS credentials found. Run this from AWS CloudShell."
 REGION=$(aws configure get region 2>/dev/null || echo "us-east-1")
-ok "AWS account $ACCOUNT_ID in region $REGION"
+ok "Account $ACCOUNT_ID · Region $REGION"
 
-# ── prereq 2: Marketplace container image ──────────────────────────────
-banner "Prereq 2/3 — AWS Marketplace container image URI"
-echo "  You need an active AWS Marketplace subscription for the JSL DICOM De-ID product."
-echo "  The container image URI looks like:"
-echo "    709825985650.dkr.ecr.us-east-1.amazonaws.com/john-snow-labs/jsl-dicom-deid:latest"
+# ── prereq 2: JSL license secret (customer created this beforehand) ────
+banner "Step 2/5 — JSL license secret"
+echo "  You need a Secrets Manager secret containing your JSL license."
+echo "  If you haven't created it yet, open a new browser tab and do this first:"
 echo ""
-read -p "  Paste your Marketplace container image URI: " CONTAINER_IMAGE
-[[ -z "$CONTAINER_IMAGE" ]] && err "Container image URI is required. Subscribe at AWS Marketplace first."
+echo "    AWS Console → Secrets Manager → Store a new secret"
+echo "    → Other type of secret → paste your JSL license JSON → save"
+echo "    → copy the secret ARN from the detail page"
+echo ""
+read -p "  Secret ARN: " JSL_SECRET_ARN
+[[ -z "$JSL_SECRET_ARN" ]] && err "Secret ARN required. Create the secret in Secrets Manager and re-run."
 
-# Validate it looks like an ECR URI (loose check)
-if ! echo "$CONTAINER_IMAGE" | grep -qE '^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+'; then
-  warn "URI doesn't look like an ECR address. Double-check before continuing."
-  read -p "  Continue anyway? [y/N] " -r CONT
-  [[ "${CONT:-N}" =~ ^[Yy]$ ]] || err "Aborted — fix the container image URI and re-run."
-fi
-ok "Container image: $CONTAINER_IMAGE"
-
-# ── prereq 3: JSL license secret ──────────────────────────────────────
-banner "Prereq 3/3 — JSL license secret in Secrets Manager"
-echo "  Your JSL license must already be stored in AWS Secrets Manager"
-echo "  before this script can proceed."
-echo ""
-echo "  If you haven't done this yet:"
-echo "    1. Open Secrets Manager in the AWS Console"
-echo "    2. Store a new secret → Other type of secret"
-echo "    3. Paste your JSL license JSON (provided by John Snow Labs)"
-echo "    4. Name it anything (e.g. jsl-dicom-deid-license)"
-echo "    5. Copy the full secret ARN from the secret's detail page"
-echo ""
-echo "  The secret ARN looks like:"
-echo "    arn:aws:secretsmanager:us-east-1:123456789012:secret:jsl-dicom-deid-license-AbCdEf"
-echo ""
-read -p "  Paste your secret ARN: " JSL_SECRET_ARN
-[[ -z "$JSL_SECRET_ARN" ]] && err "Secret ARN is required. Create the secret in Secrets Manager first."
-
-# Validate the secret exists and is readable
-echo "  Validating secret..."
+echo "  Validating..."
 SECRET_VALUE=$(aws secretsmanager get-secret-value \
   --secret-id "$JSL_SECRET_ARN" --region "$REGION" \
   --query SecretString --output text 2>/dev/null) \
-  || err "Could not read secret '$JSL_SECRET_ARN'. Check the ARN and that you have secretsmanager:GetSecretValue permission."
+  || err "Cannot read secret. Check the ARN and your IAM permissions."
 
-# Check all required fields are present and non-empty
-MISSING_FIELDS=""
+MISSING=""
 for FIELD in SPARK_NLP_LICENSE SPARK_OCR_LICENSE SECRET SPARK_OCR_SECRET; do
-  if ! python3 -c "import sys,json; d=json.load(sys.stdin); assert '$FIELD' in d and len(d['$FIELD']) > 10" \
-       <<< "$SECRET_VALUE" 2>/dev/null; then
-    MISSING_FIELDS="$MISSING_FIELDS $FIELD"
-  fi
+  python3 -c "import sys,json; d=json.load(sys.stdin); assert '$FIELD' in d and len(d['$FIELD'])>10" \
+    <<< "$SECRET_VALUE" 2>/dev/null || MISSING="$MISSING $FIELD"
 done
-[[ -z "$MISSING_FIELDS" ]] \
-  || err "Secret is missing or has empty fields:$MISSING_FIELDS — update the secret and re-run."
+[[ -z "$MISSING" ]] || err "Secret is missing required fields:$MISSING"
+ok "License secret valid"
 
-ok "Secret validated — all required license fields present"
-
-echo ""
-echo -e "${BOLD}  Summary of what will be deployed:${RESET}"
-echo "  Account       : $ACCOUNT_ID"
-echo "  Region        : $REGION"
-echo "  Stack name    : $STACK_NAME"
-echo "  S3 bucket     : jsl-dicom-deid-${ACCOUNT_ID}-${REGION}  (created by stack)"
-echo "  JSL secret    : $JSL_SECRET_ARN"
-echo "  Container     : $CONTAINER_IMAGE"
-echo "  Instance type : omics.m.xlarge (4 vCPU / 16 GB — cheapest for this workload)"
-echo ""
-read -p "  Proceed with deployment? [y/N] " -r PROCEED
-[[ "${PROCEED:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-
-# ── warn about resources already running ──────────────────────────────
+# ── warn if resources already running from a previous deploy ───────────
 if [[ -f "$STATE_FILE" ]]; then
-  banner "Previous deployment detected"
-  cat "$STATE_FILE"
-  echo ""
-  RUNNING_RUNS=$(aws omics list-runs --region "$REGION" \
+  warn "Previous deployment state found — checking for running resources..."
+  RUNNING=$(aws omics list-runs --region "$REGION" \
     --query "items[?status=='RUNNING'].id" --output text 2>/dev/null || true)
-  if [[ -n "$RUNNING_RUNS" ]]; then
-    warn "HealthOmics runs still RUNNING (accruing cost): $RUNNING_RUNS"
-    read -p "  Continue anyway? [y/N] " -r CONT
-    [[ "${CONT:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-  fi
+  [[ -n "$RUNNING" ]] && warn "HealthOmics runs still RUNNING (costing money): $RUNNING"
+  read -p "  Continue anyway? [y/N] " -r CONT
+  [[ "${CONT:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 fi
 
+# ── confirm before spending money ─────────────────────────────────────
+echo ""
+echo -e "${BOLD}  What will be created:${RESET}"
+echo "  • VPC + NAT Gateway + private/public subnets"
+echo "  • Secrets Manager VPC endpoint (private access to your secret)"
+echo "  • S3 bucket: jsl-dicom-deid-${ACCOUNT_ID}-${REGION}"
+echo "  • IAM run role for HealthOmics"
+echo "  • HealthOmics VPC configuration"
+echo "  • Two HealthOmics workflows (validate + production)"
+echo ""
+echo "  ⚠  NAT Gateway accrues ~\$0.045/hr until you run cleanup.sh"
+echo ""
+read -p "  Proceed? [y/N] " -r PROCEED
+[[ "${PROCEED:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
 # ── clone repo ─────────────────────────────────────────────────────────
-banner "Cloning repo"
+banner "Step 3/5 — Deploying infrastructure"
 git clone --quiet --depth 1 "$REPO_URL" "$WORK_DIR"
 trap "rm -rf '$WORK_DIR' /tmp/workflow-validate.zip /tmp/workflow-prod.zip /tmp/validate-params.json" EXIT
 
-# ── deploy CloudFormation ──────────────────────────────────────────────
-banner "Deploying CloudFormation stack: $STACK_NAME"
-echo "  This creates VPC, NAT Gateway, IAM role, Secrets Manager secret."
-echo "  ⚠  NAT Gateway will accrue ~\$0.045/hr until you run cleanup.sh"
-echo ""
 aws cloudformation deploy \
   --template-file "$WORK_DIR/infra/setup.yml" \
-  --stack-name   "$STACK_NAME" \
-  --capabilities CAPABILITY_NAMED_IAM \
+  --stack-name    "$STACK_NAME" \
+  --capabilities  CAPABILITY_NAMED_IAM \
   --parameter-overrides JslSecretArn="$JSL_SECRET_ARN" \
   --region "$REGION"
 ok "Stack deployed"
 
-# ── read stack outputs ─────────────────────────────────────────────────
 _out() {
   aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" --region "$REGION" \
@@ -146,45 +100,32 @@ _out() {
     --output text
 }
 BUCKET=$(_out S3BucketName)
-SECRET_ARN="$JSL_SECRET_ARN"          # supplied and validated during prereq check
 RUN_ROLE_ARN=$(_out OmicsRunRoleArn)
 VPC_CONFIG=$(_out OmicsVpcConfigName)
+echo "  S3 bucket  : $BUCKET"
+echo "  Run role   : $RUN_ROLE_ARN"
+echo "  VPC config : $VPC_CONFIG"
 
-echo "  Bucket      : $BUCKET"
-echo "  Secret ARN  : $SECRET_ARN"
-echo "  Run Role    : $RUN_ROLE_ARN"
-echo "  VPC Config  : $VPC_CONFIG"
-
-# ── register HealthOmics workflows ─────────────────────────────────────
-banner "Registering HealthOmics workflows"
-
-# Zip from within the workflow dir so relative import paths are preserved
+# ── register workflows ─────────────────────────────────────────────────
+banner "Step 4/5 — Registering HealthOmics workflows"
 pushd "$WORK_DIR/workflow" > /dev/null
 
 zip -q /tmp/workflow-validate.zip validate.wdl tasks/validate.wdl
 VALIDATE_WF_ID=$(aws omics create-workflow \
-  --name   "jsl-dicom-deid-validate" \
-  --engine WDL \
-  --main   validate.wdl \
+  --name "jsl-dicom-deid-validate" --engine WDL --main validate.wdl \
   --definition-zip fileb:///tmp/workflow-validate.zip \
-  --region "$REGION" \
-  --query  id --output text)
+  --region "$REGION" --query id --output text)
 ok "Validate workflow: $VALIDATE_WF_ID"
 
 zip -q /tmp/workflow-prod.zip main.wdl tasks/deidentify.wdl
 PROD_WF_ID=$(aws omics create-workflow \
-  --name   "jsl-dicom-deid" \
-  --engine WDL \
-  --main   main.wdl \
+  --name "jsl-dicom-deid" --engine WDL --main main.wdl \
   --definition-zip fileb:///tmp/workflow-prod.zip \
-  --region "$REGION" \
-  --query  id --output text)
+  --region "$REGION" --query id --output text)
 ok "Production workflow: $PROD_WF_ID"
 
 popd > /dev/null
 
-# Wait for both workflows to become ACTIVE before starting a run
-banner "Waiting for workflows to become ACTIVE"
 for WF_ID in "$VALIDATE_WF_ID" "$PROD_WF_ID"; do
   WF_STATUS="CREATING"
   for i in $(seq 1 24); do
@@ -193,22 +134,33 @@ for WF_ID in "$VALIDATE_WF_ID" "$PROD_WF_ID"; do
     echo "  Workflow $WF_ID: $WF_STATUS — waiting 15s..."
     sleep 15
   done
-  [[ "$WF_STATUS" == "ACTIVE" ]] || err "Workflow $WF_ID never became ACTIVE (last status: $WF_STATUS)"
+  [[ "$WF_STATUS" == "ACTIVE" ]] || err "Workflow $WF_ID never became ACTIVE (status: $WF_STATUS)"
   ok "Workflow $WF_ID is ACTIVE"
 done
 
-# ── run validation workflow ────────────────────────────────────────────
-banner "Starting validation run"
-echo "  Hardware : omics.m.xlarge (4 vCPU, 16 GB) — cheapest available"
-echo "  Est. cost: ~\$2–5"
-echo "  Est. time: ~10 minutes"
+# ── validation run ─────────────────────────────────────────────────────
+banner "Step 5/5 — Validation run"
+echo "  This runs the pipeline on a bundled test DICOM to confirm everything works."
+echo "  Hardware: omics.m.xlarge (4 vCPU / 16 GB) — cheapest available"
+echo "  Est. time: ~10 minutes · Est. cost: ~\$2–5"
 echo ""
+echo "  You need your AWS Marketplace container image URI to start the run."
+echo "  It looks like: 709825985650.dkr.ecr.us-east-1.amazonaws.com/john-snow-labs/jsl-dicom-deid:latest"
+echo ""
+read -p "  Container image URI: " CONTAINER_IMAGE
+[[ -z "$CONTAINER_IMAGE" ]] && err "Container image URI required. Subscribe to the product on AWS Marketplace."
+
+if ! echo "$CONTAINER_IMAGE" | grep -qE '^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+'; then
+  warn "URI doesn't look like an ECR address — double-check it."
+  read -p "  Continue anyway? [y/N] " -r CONT
+  [[ "${CONT:-N}" =~ ^[Yy]$ ]] || err "Aborted."
+fi
 
 cat > /tmp/validate-params.json <<EOF
 {
   "output_s3_uri":   "s3://${BUCKET}/validation-output/",
   "container_image": "${CONTAINER_IMAGE}",
-  "jsl_secret_arn":  "${SECRET_ARN}",
+  "jsl_secret_arn":  "${JSL_SECRET_ARN}",
   "instance_type":   "omics.m.xlarge"
 }
 EOF
@@ -224,7 +176,7 @@ RUN_ID=$(aws omics start-run \
   --query id --output text)
 ok "Run started: $RUN_ID"
 
-# ── save state to disk ─────────────────────────────────────────────────
+# ── save state ─────────────────────────────────────────────────────────
 cat > "$STATE_FILE" <<EOF
 {
   "stack_name":           "$STACK_NAME",
@@ -237,14 +189,13 @@ cat > "$STATE_FILE" <<EOF
   "deployed_at":          "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
-echo "  State saved to $STATE_FILE"
 
-# ── poll for validation result ─────────────────────────────────────────
-banner "Polling validation run"
+# ── poll ───────────────────────────────────────────────────────────────
+echo "  Polling every 30s..."
 FINAL_STATUS="UNKNOWN"
 for i in $(seq 1 40); do
   STATUS=$(aws omics get-run --id "$RUN_ID" --region "$REGION" --query status --output text)
-  echo "  [$(date +%H:%M:%S)] Run $RUN_ID → $STATUS"
+  echo "  [$(date +%H:%M:%S)] $STATUS"
   case "$STATUS" in
     COMPLETED) FINAL_STATUS="COMPLETED"; break ;;
     FAILED|CANCELLED) FINAL_STATUS="$STATUS"; break ;;
@@ -254,27 +205,19 @@ done
 
 echo ""
 if [[ "$FINAL_STATUS" == "COMPLETED" ]]; then
-  ok "VALIDATION PASSED — setup is ready for production use"
-  echo "  De-identified test output: s3://$BUCKET/validation-output/"
+  ok "VALIDATION PASSED — ready for production use"
+  echo "  Output: s3://$BUCKET/validation-output/"
 else
   warn "VALIDATION $FINAL_STATUS"
-  echo "  Fetch logs:"
-  echo "    aws logs tail /aws/omics/runs --since 1h --region $REGION"
+  echo "  Logs: aws logs tail /aws/omics/runs --since 1h --region $REGION"
 fi
 
-# ── resource cost warning (always shown) ──────────────────────────────
+# ── cost warning (always shown) ────────────────────────────────────────
 echo ""
-echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "  ⚠  RESOURCES LEFT RUNNING — ONGOING COSTS"
-echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "  Resource      Cost            Detail"
-echo -e "  NAT Gateway   \$0.045/hr       (~\$1.08/day, ~\$32/month)"
-echo -e "  S3 bucket     \$0.023/GB-mo    (negligible for test data)"
-echo -e "  Secrets Mgr   \$0.40/secret-mo (negligible)"
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "  ⚠  RESOURCES STILL RUNNING"
+echo -e "  NAT Gateway ~\$0.045/hr (~\$1.08/day) until you run cleanup"
 echo -e ""
-echo -e "  Stack : $STACK_NAME  |  Region : $REGION"
-echo -e "  Run   : $RUN_ID  |  Status : $FINAL_STATUS"
-echo -e ""
-echo -e "  Check status : curl -sSL ${RAW_BASE}/scripts/status.sh | bash"
-echo -e "  Tear down    : curl -sSL ${RAW_BASE}/scripts/cleanup.sh | bash"
-echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+echo -e "  Status  : curl -sSL ${RAW_BASE}/scripts/status.sh | bash"
+echo -e "  Cleanup : curl -sSL ${RAW_BASE}/scripts/cleanup.sh | bash"
+echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
