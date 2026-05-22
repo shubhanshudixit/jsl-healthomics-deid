@@ -17,13 +17,73 @@ ok()    { echo -e "${GREEN}✅ $*${RESET}"; }
 err()   { echo -e "${RED}❌ $*${RESET}"; exit 1; }
 banner(){ echo -e "\n${BOLD}── $* ──${RESET}"; }
 
-# ── detect AWS environment ─────────────────────────────────────────────
-banner "Detecting AWS environment"
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text) \
-  || err "AWS credentials not configured. Run from AWS CloudShell or configure 'aws configure'."
+# ═══════════════════════════════════════════════════════════════════════
+# PREREQUISITES CHECK
+# Verify the user has everything they need before spending any time or
+# money deploying infrastructure.
+# ═══════════════════════════════════════════════════════════════════════
+echo -e "${BOLD}"
+echo "  ╔══════════════════════════════════════════════════════════════╗"
+echo "  ║     JSL DICOM De-Identification — AWS HealthOmics Setup     ║"
+echo "  ╚══════════════════════════════════════════════════════════════╝"
+echo -e "${RESET}"
+echo "  Before we begin, confirm you have the following ready."
+echo "  The script will stop immediately if anything is missing."
+echo ""
+
+# ── prereq 1: AWS CLI / credentials ────────────────────────────────────
+banner "Prereq 1/3 — AWS credentials"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
+  || err "No AWS credentials found. Open this from AWS CloudShell, or run 'aws configure' first."
 REGION=$(aws configure get region 2>/dev/null || echo "us-east-1")
-echo "  Account : $ACCOUNT_ID"
-echo "  Region  : $REGION"
+ok "AWS account $ACCOUNT_ID in region $REGION"
+
+# ── prereq 2: Marketplace container image ──────────────────────────────
+banner "Prereq 2/3 — AWS Marketplace container image URI"
+echo "  You need an active AWS Marketplace subscription for the JSL DICOM De-ID product."
+echo "  The container image URI looks like:"
+echo "    709825985650.dkr.ecr.us-east-1.amazonaws.com/john-snow-labs/jsl-dicom-deid:latest"
+echo ""
+read -p "  Paste your Marketplace container image URI: " CONTAINER_IMAGE
+[[ -z "$CONTAINER_IMAGE" ]] && err "Container image URI is required. Subscribe at AWS Marketplace first."
+
+# Validate it looks like an ECR URI (loose check)
+if ! echo "$CONTAINER_IMAGE" | grep -qE '^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+'; then
+  warn "URI doesn't look like an ECR address. Double-check before continuing."
+  read -p "  Continue anyway? [y/N] " -r CONT
+  [[ "${CONT:-N}" =~ ^[Yy]$ ]] || err "Aborted — fix the container image URI and re-run."
+fi
+ok "Container image: $CONTAINER_IMAGE"
+
+# ── prereq 3: JSL license ──────────────────────────────────────────────
+banner "Prereq 3/3 — JSL license"
+echo "  Your JSL license is a JSON document provided by John Snow Labs."
+echo "  It contains SPARK_NLP_LICENSE, SPARK_OCR_LICENSE, SECRET, and related fields."
+echo "  You will paste it into AWS Secrets Manager after the stack deploys."
+echo ""
+echo "  Do you have your JSL license JSON from John Snow Labs?"
+read -p "  [y/N]: " -r HAS_LICENSE
+[[ "${HAS_LICENSE:-N}" =~ ^[Yy]$ ]] \
+  || err "You need a JSL license to use this product. Contact John Snow Labs to obtain one."
+ok "License confirmed — you will paste it into Secrets Manager after the stack deploys"
+
+# ── secret name ───────────────────────────────────────────────────────
+echo ""
+read -p "  Name for the Secrets Manager secret [jsl-dicom-deid-license]: " SECRET_NAME
+SECRET_NAME="${SECRET_NAME:-jsl-dicom-deid-license}"
+
+echo ""
+echo -e "${BOLD}  Summary of what will be deployed:${RESET}"
+echo "  Account       : $ACCOUNT_ID"
+echo "  Region        : $REGION"
+echo "  Stack name    : $STACK_NAME"
+echo "  S3 bucket     : jsl-dicom-deid-${ACCOUNT_ID}-${REGION}  (created by stack)"
+echo "  Secret name   : $SECRET_NAME  (you will paste your license into it)"
+echo "  Container     : $CONTAINER_IMAGE"
+echo "  Instance type : omics.m.xlarge (4 vCPU / 16 GB — cheapest for this workload)"
+echo ""
+read -p "  Proceed with deployment? [y/N] " -r PROCEED
+[[ "${PROCEED:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
 # ── warn about resources already running ──────────────────────────────
 if [[ -f "$STATE_FILE" ]]; then
@@ -34,24 +94,10 @@ if [[ -f "$STATE_FILE" ]]; then
     --query "items[?status=='RUNNING'].id" --output text 2>/dev/null || true)
   if [[ -n "$RUNNING_RUNS" ]]; then
     warn "HealthOmics runs still RUNNING (accruing cost): $RUNNING_RUNS"
-    warn "Run the status script to investigate before proceeding."
-    echo -e "  ${BOLD}curl -sSL ${RAW_BASE}/scripts/status.sh | bash${RESET}"
-    read -p "Continue anyway? [y/N] " -r CONT
+    read -p "  Continue anyway? [y/N] " -r CONT
     [[ "${CONT:-N}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
   fi
 fi
-
-# ── inputs ─────────────────────────────────────────────────────────────
-banner "Configuration"
-read -p "  Marketplace container image URI: " CONTAINER_IMAGE
-[[ -z "$CONTAINER_IMAGE" ]] && err "Container image URI is required"
-read -p "  JSL secret name [jsl-dicom-deid-license]: " SECRET_NAME
-SECRET_NAME="${SECRET_NAME:-jsl-dicom-deid-license}"
-echo ""
-echo "  Stack name     : $STACK_NAME"
-echo "  Container image: $CONTAINER_IMAGE"
-echo "  Secret name    : $SECRET_NAME"
-echo "  Instance type  : omics.m.xlarge (4 vCPU / 16 GB — cheapest available)"
 
 # ── clone repo ─────────────────────────────────────────────────────────
 banner "Cloning repo"
@@ -87,6 +133,55 @@ echo "  Bucket      : $BUCKET"
 echo "  Secret ARN  : $SECRET_ARN"
 echo "  Run Role    : $RUN_ROLE_ARN"
 echo "  VPC Config  : $VPC_CONFIG"
+
+# ── populate JSL license into Secrets Manager ──────────────────────────
+# The stack created a placeholder secret. The workflow will fail unless the
+# real license is in place before we start the run.
+banner "Action required — paste your JSL license into Secrets Manager"
+CONSOLE_URL="https://${REGION}.console.aws.amazon.com/secretsmanager/home?region=${REGION}#!/secret?name=${SECRET_NAME}"
+echo ""
+echo "  The stack created a Secrets Manager secret with placeholder values."
+echo "  You must replace them with your real JSL license JSON now."
+echo ""
+echo "  1. Open this URL in your browser (Ctrl+click or copy-paste):"
+echo -e "     ${BOLD}${CONSOLE_URL}${RESET}"
+echo ""
+echo "  2. Click 'Retrieve secret value'  →  'Edit'"
+echo ""
+echo "  3. Replace the entire JSON with your JSL license JSON:"
+echo '     {'
+echo '       "SPARK_NLP_LICENSE":  "eyJhbGci...  (your JWT)",  '
+echo '       "SPARK_OCR_LICENSE":  "eyJhbGci...  (your JWT)",'
+echo '       "SECRET":             "6.x.x-xxxxx",'
+echo '       "SPARK_OCR_SECRET":   "6.x.x-xxxxx",'
+echo '       "JSL_VERSION":        "6.4.0",'
+echo '       "OCR_VERSION":        "6.4.0",'
+echo '       "PUBLIC_VERSION":     "6.4.0"'
+echo '     }'
+echo ""
+echo "  4. Do NOT include AWS_ACCESS_KEY_ID / SECRET_ACCESS_KEY / SESSION_TOKEN."
+echo "     The container fetches fresh credentials automatically."
+echo ""
+read -p "  Press Enter once you have saved the license in Secrets Manager..."
+
+# Validate the secret is no longer a placeholder
+echo "  Validating secret..."
+SECRET_VALUE=$(aws secretsmanager get-secret-value \
+  --secret-id "$SECRET_ARN" --region "$REGION" \
+  --query SecretString --output text 2>/dev/null) \
+  || err "Could not read secret $SECRET_ARN — check IAM permissions."
+
+if echo "$SECRET_VALUE" | grep -q "PASTE_YOUR"; then
+  err "Secret still contains placeholder text. Please edit the secret in Secrets Manager and re-run this script."
+fi
+
+# Check required fields are present
+for FIELD in SPARK_NLP_LICENSE SPARK_OCR_LICENSE SECRET SPARK_OCR_SECRET; do
+  if ! echo "$SECRET_VALUE" | python3 -c "import sys,json; d=json.load(sys.stdin); assert '$FIELD' in d and d['$FIELD'] != ''" 2>/dev/null; then
+    err "Secret is missing or has empty field: $FIELD. Edit the secret and re-run."
+  fi
+done
+ok "License secret validated — all required fields present"
 
 # ── register HealthOmics workflows ─────────────────────────────────────
 banner "Registering HealthOmics workflows"
