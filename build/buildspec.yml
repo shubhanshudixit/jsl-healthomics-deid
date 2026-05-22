@@ -1,0 +1,27 @@
+version: 0.2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Required CodeBuild environment variables:
+#   ECR_REPO        - Full ECR URI e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/jsl-dicom-deid
+#   JSL_SECRET_NAME - Secrets Manager secret name containing the JSL license JSON
+# ─────────────────────────────────────────────────────────────────────────────
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging into ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPO
+      - echo Fetching JSL license from Secrets Manager...
+      - aws secretsmanager get-secret-value --secret-id $JSL_SECRET_NAME --query SecretString --output text > jsl_license.json
+
+  build:
+    commands:
+      - echo Building Docker image... This will take 20-40 minutes.
+      - docker build --secret id=license,src=jsl_license.json -t jsl-dicom-deid .
+      - docker tag jsl-dicom-deid:latest $ECR_REPO:latest
+
+  post_build:
+    commands:
+      - echo Pushing image to ECR...
+      - docker push $ECR_REPO:latest
+      - echo Build complete!

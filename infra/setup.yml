@@ -1,0 +1,465 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  JSL DICOM De-Identification — AWS HealthOmics Marketplace Setup.
+  Deploys everything a customer needs in one click:
+  VPC + NAT networking, IAM run role, Secrets Manager secret placeholder,
+  S3 bucket, and the HealthOmics VPC configuration.
+  Supported regions: us-east-1, us-west-2, eu-west-1, eu-west-2,
+  eu-central-1, ap-southeast-1, ap-southeast-2.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameter grouping for the AWS Console wizard (non-technical users see
+# a clean form with labelled sections).
+# ─────────────────────────────────────────────────────────────────────────────
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "1. JSL License"
+        Parameters:
+          - JslSecretName
+      - Label:
+          default: "2. Networking"
+        Parameters:
+          - VpcCidr
+          - OmicsVpcConfigName
+    ParameterLabels:
+      JslSecretName:
+        default: "Secret name for your JSL license (you will paste the license JSON after deploy)"
+      VpcCidr:
+        default: "VPC CIDR block (leave default unless it conflicts with your existing VPCs)"
+      OmicsVpcConfigName:
+        default: "Name for the HealthOmics VPC configuration"
+
+Parameters:
+  JslSecretName:
+    Type: String
+    Default: jsl-dicom-deid-license
+    Description: Name for the Secrets Manager secret that will hold your JSL license JSON.
+    AllowedPattern: "^[a-zA-Z0-9/_+=.@-]+$"
+    ConstraintDescription: Must be a valid Secrets Manager secret name.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the new VPC. Change only if 10.0.0.0/16 conflicts with your existing network.
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+
+  OmicsVpcConfigName:
+    Type: String
+    Default: jsl-deid-vpc-config
+    Description: Name for the HealthOmics VPC configuration created by this stack.
+    AllowedPattern: "^[a-zA-Z0-9_-]+$"
+
+Resources:
+
+  # ── VPC ───────────────────────────────────────────────────────────────────
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true      # Required by HealthOmics and VPC endpoints
+      EnableDnsHostnames: true    # Required for interface endpoint private DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  VpcIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet: holds the NAT gateway so private traffic can reach the internet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public"
+
+  # Private subnet: HealthOmics places its ENI here at runtime
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false   # Must be false for HealthOmics ENIs
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcIgwAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  # Public route table — 0.0.0.0/0 → IGW
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcIgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRtAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private route table — 0.0.0.0/0 → NAT (explicit association required)
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRtAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # S3 gateway endpoint — routes S3 traffic through AWS backbone (free, no NAT charges for S3)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+
+  # Attached to the HealthOmics ENI placed in the private subnet.
+  # Needs outbound 443 to reach: Secrets Manager VPC endpoint and NAT (for licensecheck.johnsnowlabs.com).
+  OmicsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HealthOmics task ENI - outbound HTTPS only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to Secrets Manager endpoint, NAT, and licensecheck.johnsnowlabs.com
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-omics-sg"
+
+  # Attached to the Secrets Manager VPC interface endpoint.
+  # Allows inbound 443 from the HealthOmics ENI so the container can call GetSecretValue.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Secrets Manager VPC endpoint - inbound HTTPS from HealthOmics tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref OmicsSecurityGroup
+          Description: Allow HealthOmics tasks to call Secrets Manager
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-endpoint-sg"
+
+  # ── Secrets Manager VPC Interface Endpoint ────────────────────────────────
+  # Allows the container to call GetSecretValue without leaving the VPC.
+  # Private DNS enabled so boto3 resolves secretsmanager.REGION.amazonaws.com to a private IP.
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  # ── S3 Bucket ─────────────────────────────────────────────────────────────
+
+  JslDicomBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain   # Keeps the bucket if the stack is deleted (data is safe)
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "jsl-dicom-deid-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-dicom-bucket"
+
+  # ── IAM Run Role ──────────────────────────────────────────────────────────
+
+  OmicsRunRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-omics-run-role"
+      Description: IAM role assumed by HealthOmics tasks to access S3, ECR, Secrets Manager, and CloudWatch Logs.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: omics.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: JslDeidRunPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt JslDicomBucket.Arn
+                  - !Sub "${JslDicomBucket.Arn}/*"
+              - Sid: EcrAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                Resource: "*"
+              - Sid: SecretsAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref JslLicenseSecret
+              - Sid: LogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/omics/*"
+
+  # ── Secrets Manager Secret ────────────────────────────────────────────────
+  # Placeholder — customer fills in their JSL license JSON after the stack deploys.
+
+  JslLicenseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref JslSecretName
+      Description: >
+        JSL license JSON for DICOM de-identification.
+        After the stack deploys, edit this secret and paste your JSL license JSON.
+        See the Customer Onboarding Guide for the required JSON format.
+      SecretString: |
+        {
+          "SPARK_NLP_LICENSE":    "PASTE_YOUR_SPARK_NLP_LICENSE_JWT_HERE",
+          "SPARK_OCR_LICENSE":    "PASTE_YOUR_SPARK_OCR_LICENSE_JWT_HERE",
+          "SECRET":               "PASTE_YOUR_JSL_SECRET_HERE",
+          "SPARK_OCR_SECRET":     "PASTE_YOUR_SPARK_OCR_SECRET_HERE",
+          "JSL_VERSION":          "6.4.0",
+          "OCR_VERSION":          "6.4.0",
+          "PUBLIC_VERSION":       "6.4.0"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-jsl-license"
+
+  # ── HealthOmics VPC Configuration (Lambda-backed Custom Resource) ──────────
+  # HealthOmics VPC configurations are not native CloudFormation resources, so
+  # we use a Lambda custom resource to create and clean up the configuration.
+
+  OmicsConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-omics-config-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OmicsConfigPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - omics:CreateConfiguration
+                  - omics:DeleteConfiguration
+                  - omics:ListConfigurations
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  OmicsConfigLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-omics-vpc-config"
+      Description: Custom resource handler — creates and deletes the HealthOmics VPC configuration.
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt OmicsConfigLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json, boto3, urllib3
+
+          def send(e, c, status, data={}, pid=None, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or ('CloudWatch log stream: ' + c.log_stream_name),
+                  'PhysicalResourceId': pid or c.log_stream_name,
+                  'StackId': e['StackId'],
+                  'RequestId': e['RequestId'],
+                  'LogicalResourceId': e['LogicalResourceId'],
+                  'Data': data,
+              })
+              urllib3.PoolManager().request(
+                  'PUT', e['ResponseURL'],
+                  body=body.encode(),
+                  headers={'Content-Type': ''},
+              )
+
+          def handler(event, context):
+              p = event['ResourceProperties']
+              omics = boto3.client('omics', region_name=p['Region'])
+              name = p['ConfigName']
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      omics.create_configuration(
+                          name=name,
+                          runConfigurations={
+                              'vpcConfig': {
+                                  'subnetIds': p['SubnetIds'],
+                                  'securityGroupIds': p['SecurityGroupIds'],
+                              }
+                          },
+                      )
+                      send(event, context, 'SUCCESS', {'ConfigName': name}, pid=name)
+                  else:
+                      try:
+                          omics.delete_configuration(name=name)
+                      except Exception:
+                          pass
+                      send(event, context, 'SUCCESS', pid=name)
+              except Exception as ex:
+                  send(event, context, 'FAILED', reason=str(ex), pid=name)
+
+  OmicsVpcConfiguration:
+    Type: Custom::OmicsVpcConfig
+    DependsOn:
+      - PrivateSubnetRtAssociation
+      - SecretsManagerEndpoint
+    Properties:
+      ServiceToken: !GetAtt OmicsConfigLambda.Arn
+      Region: !Ref AWS::Region
+      ConfigName: !Ref OmicsVpcConfigName
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref OmicsSecurityGroup
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outputs — everything the customer needs to run workflows
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  S3BucketName:
+    Description: "S3 bucket for your DICOM input/output files. Upload your input DICOMs here."
+    Value: !Ref JslDicomBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-bucket"
+
+  JslSecretArn:
+    Description: "ARN of the Secrets Manager secret — paste your JSL license JSON into this secret before running any workflow."
+    Value: !Ref JslLicenseSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-secret-arn"
+
+  OmicsRunRoleArn:
+    Description: "IAM role ARN to pass as --role-arn when starting HealthOmics runs."
+    Value: !GetAtt OmicsRunRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-run-role-arn"
+
+  OmicsVpcConfigName:
+    Description: "HealthOmics VPC configuration name — pass as --configuration-name when starting runs."
+    Value: !Ref OmicsVpcConfigName
+    Export:
+      Name: !Sub "${AWS::StackName}-vpc-config-name"
+
+  VpcId:
+    Description: "VPC ID created by this stack."
+    Value: !Ref Vpc
+
+  PrivateSubnetId:
+    Description: "Private subnet ID where HealthOmics ENIs are placed."
+    Value: !Ref PrivateSubnet
+
+  NextStep:
+    Description: "ACTION REQUIRED — Open the Secrets Manager console, find the secret above, and paste your JSL license JSON."
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/secretsmanager/home?region=${AWS::Region}#!/secret?name=${JslSecretName}"

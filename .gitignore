@@ -1,0 +1,26 @@
+# Sensitive files — never commit
+jsl_license.json
+*.env
+params.json
+validate_params.json
+
+# Workflow zips (built at deploy time)
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp extraction dirs
+tmp-*/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+
+# Local deploy state (written by CloudShell scripts)
+jsl-deploy-state.json

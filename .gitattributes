@@ -1,0 +1,12 @@
+# Force LF for all shell scripts — they run on Linux (CloudShell) and
+# must not have CRLF line endings regardless of the author's OS.
+scripts/*.sh   text eol=lf
+*.wdl          text eol=lf
+*.py           text eol=lf
+*.yml          text eol=lf
+*.yaml         text eol=lf
+*.json         text eol=lf
+*.md           text eol=lf
+
+# Binary — do not mangle line endings
+*.dcm          binary

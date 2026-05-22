@@ -1,0 +1,7 @@
+{
+    "input_s3_uri":    "s3://YOUR-BUCKET/dicom-input/",
+    "output_s3_uri":   "s3://YOUR-BUCKET/dicom-output/",
+    "container_image": "YOUR-ACCOUNT-ID.dkr.ecr.YOUR-REGION.amazonaws.com/jsl-dicom-deid:latest",
+    "jsl_secret_arn":  "arn:aws:secretsmanager:YOUR-REGION:YOUR-ACCOUNT-ID:secret:YOUR-SECRET-NAME",
+    "instance_type":   "omics.m.xlarge"
+}

@@ -1,0 +1,56 @@
+name: Static Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  static-checks:
+    name: Lint & validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: pip install --quiet cfn-lint miniwdl
+
+      - name: Python syntax — build/app.py
+        run: python -m py_compile build/app.py
+
+      - name: Python syntax — build/installer.py
+        run: python -m py_compile build/installer.py
+
+      - name: CloudFormation lint — infra/setup.yml
+        run: cfn-lint infra/setup.yml
+
+      - name: WDL validate — validate workflow
+        working-directory: workflow
+        run: miniwdl check validate.wdl
+
+      - name: WDL validate — production workflow
+        working-directory: workflow
+        run: miniwdl check main.wdl
+
+      - name: JSON validate — params templates
+        run: |
+          python -m json.tool workflow/params_template.json          > /dev/null
+          python -m json.tool workflow/validate_params_template.json > /dev/null
+
+      - name: Check for hardcoded account IDs
+        run: |
+          # Fail if any real-looking 12-digit AWS account ID slipped in
+          # (placeholder IDs like 123456789012 are fine)
+          if grep -rE '\b[0-9]{12}\b' infra/ workflow/ build/app.py \
+               --include="*.yml" --include="*.wdl" --include="*.py" \
+               | grep -v "412381754881\|123456789012"; then
+            echo "ERROR: Hardcoded AWS account ID found — use parameters instead"
+            exit 1
+          fi
+          echo "No hardcoded account IDs found ✅"

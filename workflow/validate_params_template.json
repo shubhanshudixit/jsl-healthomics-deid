@@ -1,0 +1,6 @@
+{
+    "output_s3_uri":   "s3://YOUR-BUCKET-NAME/validation-output/",
+    "container_image": "MARKETPLACE-ECR-URI",
+    "jsl_secret_arn":  "arn:aws:secretsmanager:YOUR-REGION:YOUR-ACCOUNT-ID:secret:jsl-dicom-deid-license-XXXXXX",
+    "instance_type":   "omics.m.xlarge"
+}
