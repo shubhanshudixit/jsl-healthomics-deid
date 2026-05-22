@@ -1,10 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   JSL DICOM De-Identification — AWS HealthOmics Marketplace Setup.
-  Deploys VPC + NAT networking, IAM run role, S3 bucket, and the
-  HealthOmics VPC configuration. Your JSL license must already exist
-  in Secrets Manager before deploying this stack — pass its ARN as
-  the JslSecretArn parameter.
+  Creates VPC + NAT networking, IAM run role, and the HealthOmics VPC
+  configuration. Requires a pre-existing Secrets Manager secret (JSL license)
+  and customer-owned S3 buckets for input/output.
   Supported regions: us-east-1, us-west-2, eu-west-1, eu-west-2,
   eu-central-1, ap-southeast-1, ap-southeast-2.
 
@@ -12,9 +11,11 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
-          default: "1. JSL License (prerequisite — create this secret before deploying)"
+          default: "1. Prerequisites (must exist before deploying)"
         Parameters:
           - JslSecretArn
+          - InputBucketName
+          - OutputBucketName
       - Label:
           default: "2. Networking"
         Parameters:
@@ -23,20 +24,36 @@ Metadata:
     ParameterLabels:
       JslSecretArn:
         default: "ARN of your Secrets Manager secret containing the JSL license JSON"
+      InputBucketName:
+        default: "S3 bucket name where input DICOM files are stored"
+      OutputBucketName:
+        default: "S3 bucket name where de-identified files will be written"
       VpcCidr:
         default: "VPC CIDR block (leave default unless it conflicts with your existing VPCs)"
       OmicsVpcConfigName:
         default: "Name for the HealthOmics VPC configuration"
 
 Parameters:
+
   JslSecretArn:
     Type: String
     Description: >
       ARN of the Secrets Manager secret containing your JSL license JSON.
-      Create this secret before deploying the stack — see the Customer Onboarding Guide.
-      Format: arn:aws:secretsmanager:REGION:ACCOUNT:secret:SECRET-NAME-XXXXXX
+      Must exist before deploying this stack.
     AllowedPattern: "^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$"
     ConstraintDescription: Must be a valid Secrets Manager secret ARN.
+
+  InputBucketName:
+    Type: String
+    Description: Name of the S3 bucket containing your input DICOM files (not the full URI, just the bucket name).
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
+
+  OutputBucketName:
+    Type: String
+    Description: Name of the S3 bucket where de-identified files will be written. Can be the same as InputBucketName.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
 
   VpcCidr:
     Type: String
@@ -58,8 +75,8 @@ Resources:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: !Ref VpcCidr
-      EnableDnsSupport: true      # Required by HealthOmics and VPC endpoints
-      EnableDnsHostnames: true    # Required for interface endpoint private DNS
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-vpc"
@@ -77,7 +94,6 @@ Resources:
       VpcId: !Ref Vpc
       InternetGatewayId: !Ref InternetGateway
 
-  # Public subnet: holds the NAT gateway so private traffic can reach the internet
   PublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -89,14 +105,13 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-public"
 
-  # Private subnet: HealthOmics places its ENI here at runtime
   PrivateSubnet:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
       AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: false   # Must be false for HealthOmics ENIs
+      MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-private"
@@ -116,7 +131,6 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-nat"
 
-  # Public route table — 0.0.0.0/0 → IGW
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -139,7 +153,6 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
-  # Private route table — 0.0.0.0/0 → NAT (explicit association required)
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -161,7 +174,6 @@ Resources:
       SubnetId: !Ref PrivateSubnet
       RouteTableId: !Ref PrivateRouteTable
 
-  # S3 gateway endpoint — routes S3 traffic through AWS backbone (free, no NAT charges for S3)
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -174,8 +186,6 @@ Resources:
 
   # ── Security Groups ───────────────────────────────────────────────────────
 
-  # Attached to the HealthOmics ENI placed in the private subnet.
-  # Needs outbound 443 to reach: Secrets Manager VPC endpoint and NAT (for licensecheck.johnsnowlabs.com).
   OmicsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -191,8 +201,6 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-omics-sg"
 
-  # Attached to the Secrets Manager VPC interface endpoint.
-  # Allows inbound 443 from the HealthOmics ENI so the container can call GetSecretValue.
   EndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -209,8 +217,6 @@ Resources:
           Value: !Sub "${AWS::StackName}-endpoint-sg"
 
   # ── Secrets Manager VPC Interface Endpoint ────────────────────────────────
-  # Allows the container to call GetSecretValue without leaving the VPC.
-  # Private DNS enabled so boto3 resolves secretsmanager.REGION.amazonaws.com to a private IP.
 
   SecretsManagerEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -223,29 +229,6 @@ Resources:
         - !Ref PrivateSubnet
       SecurityGroupIds:
         - !Ref EndpointSecurityGroup
-
-  # ── S3 Bucket ─────────────────────────────────────────────────────────────
-
-  JslDicomBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain   # Keeps the bucket if the stack is deleted (data is safe)
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketName: !Sub "jsl-dicom-deid-${AWS::AccountId}-${AWS::Region}"
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      VersioningConfiguration:
-        Status: Suspended
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-dicom-bucket"
 
   # ── IAM Run Role ──────────────────────────────────────────────────────────
 
@@ -266,15 +249,22 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: S3Access
+              - Sid: S3InputAccess
                 Effect: Allow
                 Action:
                   - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${InputBucketName}"
+                  - !Sub "arn:aws:s3:::${InputBucketName}/*"
+              - Sid: S3OutputAccess
+                Effect: Allow
+                Action:
                   - s3:PutObject
                   - s3:ListBucket
                 Resource:
-                  - !GetAtt JslDicomBucket.Arn
-                  - !Sub "${JslDicomBucket.Arn}/*"
+                  - !Sub "arn:aws:s3:::${OutputBucketName}"
+                  - !Sub "arn:aws:s3:::${OutputBucketName}/*"
               - Sid: EcrAccess
                 Effect: Allow
                 Action:
@@ -287,7 +277,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref JslSecretArn   # customer's pre-existing secret
+                Resource: !Ref JslSecretArn
               - Sid: LogsAccess
                 Effect: Allow
                 Action:
@@ -297,8 +287,6 @@ Resources:
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/omics/*"
 
   # ── HealthOmics VPC Configuration (Lambda-backed Custom Resource) ──────────
-  # HealthOmics VPC configurations are not native CloudFormation resources, so
-  # we use a Lambda custom resource to create and clean up the configuration.
 
   OmicsConfigLambdaRole:
     Type: AWS::IAM::Role
@@ -397,22 +385,7 @@ Resources:
       SecurityGroupIds:
         - !Ref OmicsSecurityGroup
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Outputs — everything the customer needs to run workflows
-# ─────────────────────────────────────────────────────────────────────────────
 Outputs:
-
-  S3BucketName:
-    Description: "S3 bucket for your DICOM input/output files."
-    Value: !Ref JslDicomBucket
-    Export:
-      Name: !Sub "${AWS::StackName}-bucket"
-
-  JslSecretArn:
-    Description: "ARN of the JSL license secret passed into this stack (echoed back for convenience)."
-    Value: !Ref JslSecretArn
-    Export:
-      Name: !Sub "${AWS::StackName}-secret-arn"
 
   OmicsRunRoleArn:
     Description: "IAM role ARN to pass as --role-arn when starting HealthOmics runs."
@@ -421,7 +394,7 @@ Outputs:
       Name: !Sub "${AWS::StackName}-run-role-arn"
 
   OmicsVpcConfigName:
-    Description: "HealthOmics VPC configuration name — pass as --configuration-name when starting runs."
+    Description: "HealthOmics VPC configuration name."
     Value: !Ref OmicsVpcConfigName
     Export:
       Name: !Sub "${AWS::StackName}-vpc-config-name"
@@ -429,7 +402,21 @@ Outputs:
   VpcId:
     Description: "VPC ID created by this stack."
     Value: !Ref Vpc
+    Export:
+      Name: !Sub "${AWS::StackName}-vpc-id"
 
   PrivateSubnetId:
     Description: "Private subnet ID where HealthOmics ENIs are placed."
     Value: !Ref PrivateSubnet
+
+  NatGatewayId:
+    Description: "NAT Gateway ID — used by the deploy script to verify network readiness."
+    Value: !Ref NatGateway
+    Export:
+      Name: !Sub "${AWS::StackName}-nat-id"
+
+  SecretsManagerEndpointId:
+    Description: "Secrets Manager VPC endpoint ID — used by the deploy script to verify it is available."
+    Value: !Ref SecretsManagerEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-sm-endpoint-id"
